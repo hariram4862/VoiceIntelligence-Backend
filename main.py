@@ -11,6 +11,13 @@ import shutil
 import os
 import requests
 import google.generativeai as genai
+from docx import Document
+from PIL import Image
+import pytesseract
+import fitz  # PyMuPDF
+from sentence_transformers import SentenceTransformer
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, VectorParams, PointStruct
 
 app = FastAPI()
 
@@ -29,6 +36,139 @@ model = whisper.load_model("base")  # Whisper for transcription
 GEMINI_API_KEY = "AIzaSyA_ro-5MnFra6vuSJufp7LHiD4Tl0FslpQ"  # Replace this
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
+# Qdrant & Embedding setup
+embed_model = SentenceTransformer('all-MiniLM-L6-v2')
+qdrant = QdrantClient(":memory:")
+collection_name = "legal_docs"
+qdrant.recreate_collection(
+    collection_name=collection_name,
+    vectors_config=VectorParams(size=embed_model.get_sentence_embedding_dimension(), distance=Distance.COSINE),
+)
+
+# Document handling utilities
+def extract_text_from_file(path, ext):
+    try:
+        if ext == '.pdf':
+            doc = fitz.open(path)
+            text = "".join([page.get_text() for page in doc])
+            doc.close()
+        elif ext == '.docx':
+            document = Document(path)
+            text = "\n".join(p.text for p in document.paragraphs)
+        elif ext in ['.png', '.jpg', '.jpeg']:
+            text = pytesseract.image_to_string(Image.open(path))
+        elif ext == '.txt':
+            with open(path, 'r', encoding='utf-8') as f:
+                text = f.read()
+        else:
+            return None
+        return text.strip()
+    except:
+        return None
+
+def split_text(text, max_length=500, overlap=50):
+    words = text.split()
+    chunks, current_chunk = [], []
+    current_length = 0
+    for word in words:
+        if current_length + len(word) + 1 > max_length and current_chunk:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = current_chunk[-(len(current_chunk)//2):]
+            current_length = sum(len(w) for w in current_chunk)
+        current_chunk.append(word)
+        current_length += len(word) + 1
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+    return chunks
+
+async def embed_and_store(file: UploadFile):
+    ext = os.path.splitext(file.filename)[1].lower()
+    temp_path = f"temp_{file.filename}"
+    with open(temp_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    text = extract_text_from_file(temp_path, ext)
+    os.remove(temp_path)
+    if not text:
+        raise ValueError("No text extracted from file.")
+
+    chunks = split_text(text)
+    vectors = embed_model.encode(chunks, show_progress_bar=False)
+    points = [
+        PointStruct(id=i, vector=vectors[i].tolist(), payload={"text": chunks[i], "source": file.filename})
+        for i in range(len(chunks))
+    ]
+    qdrant.upsert(collection_name=collection_name, points=points, wait=True)
+    return len(chunks)
+
+def search_query(query: str, top_k=5):
+    query_vec = embed_model.encode([query])[0].tolist()
+    results = qdrant.search(collection_name=collection_name, query_vector=query_vec, limit=top_k)
+    return [r.payload["text"] for r in results]
+from fastapi import UploadFile, File, Form
+from typing import List, Optional
+
+@app.post("/query_or_upload")
+async def query_or_upload(
+    files: Optional[List[UploadFile]] = File(None),
+    prompt: Optional[str] = Form(None)
+):
+    results = []
+
+    # Handle document upload and embedding (if any)
+    if files:
+        for file in files:
+            try:
+                chunk_count = await embed_and_store(file)
+                results.append({"filename": file.filename, "chunks": chunk_count})
+            except Exception as e:
+                results.append({"filename": file.filename, "error": str(e)})
+
+    # If no prompt, return just the upload results
+    if not prompt:
+        return {"message": "✅ Documents processed.", "upload_results": results}
+
+    # If prompt is provided, proceed with document-based response
+    relevant_chunks = search_query(prompt)
+    if not relevant_chunks:
+        return {
+            "message": "⚠️ No relevant information found in documents.",
+            "upload_results": results,
+            "response": "No relevant information found."
+        }
+
+    context = "\n\n".join(relevant_chunks[:3])
+    final_prompt = f"""You are a legal assistant. Use the context below to answer the user's question.
+
+Context:
+{context}
+
+Question:
+{prompt}
+
+Answer:"""
+
+    payload = {"contents": [{"parts": [{"text": final_prompt}]}]}
+    headers = {"Content-Type": "application/json"}
+    response = requests.post(GEMINI_URL, headers=headers, json=payload)
+    result = response.json()
+
+    if "candidates" in result:
+        answer = result["candidates"][0]["content"]["parts"][0].get("text", "")
+        return {
+            "message": "✅ Documents processed and response generated.",
+            "upload_results": results,
+            "response": answer.strip()
+        }
+
+    return {
+        "message": "⚠️ Gemini failed to respond.",
+        "upload_results": results,
+        "response": "Gemini failed to generate a valid response."
+    }
+
+
+
 @app.post("/transcribe")
 async def transcribe(file: UploadFile = File(...)):
     with open("temp_audio.wav", "wb") as buffer:
@@ -38,38 +178,38 @@ async def transcribe(file: UploadFile = File(...)):
     os.remove("temp_audio.wav")
     return {"text": result.get("text", ""), "raw": result}
 
-@app.post("/upload_files")
-async def upload_files(files: List[UploadFile] = File(...)):
-    for file in files:
-        print(f"✅ Got the file: {file.filename}")
-    return {"message": f"✅ Received {len(files)} files successfully"}
+# @app.post("/upload_files")
+# async def upload_files(files: List[UploadFile] = File(...)):
+#     for file in files:
+#         print(f"✅ Got the file: {file.filename}")
+#     return {"message": f"✅ Received {len(files)} files successfully"}
 
-@app.post("/respond")
-async def respond(prompt: str = Form(...)):
-    try:
-        payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {"text": prompt}
-                    ]
-                }
-            ]
-        }
+# @app.post("/respond")
+# async def respond(prompt: str = Form(...)):
+#     try:
+#         payload = {
+#             "contents": [
+#                 {
+#                     "parts": [
+#                         {"text": prompt}
+#                     ]
+#                 }
+#             ]
+#         }
 
-        headers = {"Content-Type": "application/json"}
+#         headers = {"Content-Type": "application/json"}
 
-        response = requests.post(GEMINI_URL, headers=headers, json=payload)
-        result = response.json()
+#         response = requests.post(GEMINI_URL, headers=headers, json=payload)
+#         result = response.json()
 
-        if "candidates" in result:
-            text = result["candidates"][0]["content"]["parts"][0].get("text", "")
-            return {"response": text}
-        else:
-            return {"response": f"❌ Gemini error: {result}"}
+#         if "candidates" in result:
+#             text = result["candidates"][0]["content"]["parts"][0].get("text", "")
+#             return {"response": text}
+#         else:
+#             return {"response": f"❌ Gemini error: {result}"}
 
-    except Exception as e:
-        return {"response": f"❌ Exception: {str(e)}"}
+#     except Exception as e:
+#         return {"response": f"❌ Exception: {str(e)}"}
 
 
 # MongoDB Setup
