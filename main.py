@@ -1,10 +1,9 @@
-from fastapi import FastAPI, HTTPException,  Form, UploadFile, File
+from fastapi import FastAPI, HTTPException, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 import pytz
 import whisper
 import shutil
@@ -16,9 +15,7 @@ from PIL import Image
 import pytesseract
 import fitz  # PyMuPDF
 from sentence_transformers import SentenceTransformer
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams, PointStruct
-
+import numpy as np
 app = FastAPI()
 
 # CORS for frontend
@@ -32,20 +29,25 @@ app.add_middleware(
 
 model = whisper.load_model("base")  # Whisper for transcription
 
+# MongoDB Setup
+MONGO_URI = "mongodb+srv://hari123:hari123@cluster0.oxgsmkv.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+client = AsyncIOMotorClient(MONGO_URI)
+
+db = client.legal_assistant
+users_collection = db.users
+sessions_collection = db.sessions
+files_collection = db.files
+
+IST = pytz.timezone("Asia/Kolkata")
+
 # --- Gemini setup ---
 GEMINI_API_KEY = "AIzaSyA_ro-5MnFra6vuSJufp7LHiD4Tl0FslpQ"  # Replace this
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
 # Qdrant & Embedding setup
 embed_model = SentenceTransformer('all-MiniLM-L6-v2')
-qdrant = QdrantClient(":memory:")
-collection_name = "legal_docs"
-qdrant.recreate_collection(
-    collection_name=collection_name,
-    vectors_config=VectorParams(size=embed_model.get_sentence_embedding_dimension(), distance=Distance.COSINE),
-)
 
-# Document handling utilities
+
 def extract_text_from_file(path, ext):
     try:
         if ext == '.pdf':
@@ -81,7 +83,7 @@ def split_text(text, max_length=500, overlap=50):
         chunks.append(" ".join(current_chunk))
     return chunks
 
-async def embed_and_store(file: UploadFile):
+async def embed_and_store(file: UploadFile, email: str, session_id: str):
     ext = os.path.splitext(file.filename)[1].lower()
     temp_path = f"temp_{file.filename}"
     with open(temp_path, "wb") as f:
@@ -94,45 +96,70 @@ async def embed_and_store(file: UploadFile):
 
     chunks = split_text(text)
     vectors = embed_model.encode(chunks, show_progress_bar=False)
-    points = [
-        PointStruct(id=i, vector=vectors[i].tolist(), payload={"text": chunks[i], "source": file.filename})
-        for i in range(len(chunks))
-    ]
-    qdrant.upsert(collection_name=collection_name, points=points, wait=True)
+
+    chunk_data = []
+    for i in range(len(chunks)):
+        chunk_data.append({
+            "index": i,
+            "text": chunks[i],
+            "vector": vectors[i].tolist()
+        })
+
+    doc = {
+        "email": email,
+        "session_id": session_id,
+        "filename": file.filename,
+        "chunks": chunk_data
+    }
+
+    await files_collection.insert_one(doc)
     return len(chunks)
 
-def search_query(query: str, top_k=5):
-    query_vec = embed_model.encode([query])[0].tolist()
-    results = qdrant.search(collection_name=collection_name, query_vector=query_vec, limit=top_k)
-    return [r.payload["text"] for r in results]
-from fastapi import UploadFile, File, Form
-from typing import List, Optional
+def cosine_similarity(a, b):
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10)
 
 @app.post("/query_or_upload")
 async def query_or_upload(
     files: Optional[List[UploadFile]] = File(None),
-    prompt: Optional[str] = Form(None)
+    prompt: Optional[str] = Form(None),
+    email: Optional[str] = Form(None),
+    session_id: Optional[str] = Form(None)
 ):
     results = []
 
-    # Handle document upload and embedding (if any)
     if files:
         for file in files:
             try:
-                chunk_count = await embed_and_store(file)
+                chunk_count = await embed_and_store(file, email, session_id)
                 results.append({"filename": file.filename, "chunks": chunk_count})
             except Exception as e:
                 results.append({"filename": file.filename, "error": str(e)})
 
-    # If no prompt, return just the upload results
     if not prompt:
         return {"message": "✅ Documents processed.", "upload_results": results}
 
-    # If prompt is provided, proceed with document-based response
-    relevant_chunks = search_query(prompt)
+    query_vec = embed_model.encode([prompt])[0].tolist()
+
+    documents = await files_collection.find({
+        "email": email,
+        "session_id": session_id
+    }).to_list(length=100)
+
+    similarities = []
+    for doc in documents:
+        for chunk in doc.get("chunks", []):
+            sim = cosine_similarity(np.array(chunk["vector"]), np.array(query_vec))
+            similarities.append({
+                "text": chunk["text"],
+                "score": sim
+            })
+
+    top_chunks = sorted(similarities, key=lambda x: x["score"], reverse=True)[:5]
+    relevant_chunks = [c["text"] for c in top_chunks]
+
     if not relevant_chunks:
         return {
-            "message": "⚠️ No relevant information found in documents.",
+            "message": "⚠️ No relevant information found in session documents.",
             "upload_results": results,
             "response": "No relevant information found."
         }
@@ -169,6 +196,7 @@ Answer:"""
 
 
 
+
 @app.post("/transcribe")
 async def transcribe(file: UploadFile = File(...)):
     with open("temp_audio.wav", "wb") as buffer:
@@ -177,6 +205,7 @@ async def transcribe(file: UploadFile = File(...)):
     result = model.transcribe("temp_audio.wav")
     os.remove("temp_audio.wav")
     return {"text": result.get("text", ""), "raw": result}
+
 
 # @app.post("/upload_files")
 # async def upload_files(files: List[UploadFile] = File(...)):
@@ -212,15 +241,7 @@ async def transcribe(file: UploadFile = File(...)):
 #         return {"response": f"❌ Exception: {str(e)}"}
 
 
-# MongoDB Setup
-MONGO_URI = "mongodb+srv://hari123:hari123@cluster0.oxgsmkv.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
-client = AsyncIOMotorClient(MONGO_URI)
 
-db = client.legal_assistant
-users_collection = db.users
-sessions_collection = db.sessions
-
-IST = pytz.timezone("Asia/Kolkata")
 
 
 # ========== ENDPOINTS ==========
