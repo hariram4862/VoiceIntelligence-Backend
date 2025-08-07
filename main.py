@@ -3,10 +3,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from datetime import datetime
+from fastapi import Body
 from typing import List, Optional
 import pytz
 import whisper
 import shutil
+from fastapi import Query
+
 import os
 import requests
 import google.generativeai as genai
@@ -33,10 +36,13 @@ model = whisper.load_model("base")  # Whisper for transcription
 MONGO_URI = "mongodb+srv://hari123:hari123@cluster0.oxgsmkv.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 client = AsyncIOMotorClient(MONGO_URI)
 
-db = client.legal_assistant
+db = client.voice_intelligence
 users_collection = db.users
 sessions_collection = db.sessions
 files_collection = db.files
+shared_collection = db.shared_sessions
+import secrets
+import random
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -157,15 +163,9 @@ async def query_or_upload(
     top_chunks = sorted(similarities, key=lambda x: x["score"], reverse=True)[:5]
     relevant_chunks = [c["text"] for c in top_chunks]
 
-    if not relevant_chunks:
-        return {
-            "message": "⚠️ No relevant information found in session documents.",
-            "upload_results": results,
-            "response": "No relevant information found."
-        }
-
-    context = "\n\n".join(relevant_chunks[:3])
-    final_prompt = f"""You are a legal assistant. Use the context below to answer the user's question.
+    if relevant_chunks:
+        context = "\n\n".join(relevant_chunks[:3])
+        final_prompt = f"""You are a chatbot. Use the context below to answer the user's prompt.
 
 Context:
 {context}
@@ -174,6 +174,15 @@ Question:
 {prompt}
 
 Answer:"""
+    else:
+    # Fallback to just using the prompt if no document context is available
+        final_prompt = f"""You are a chatbot. Answer the user's question below based on your knowledge.
+
+Question:
+{prompt}
+
+Answer:"""
+
 
     payload = {"contents": [{"parts": [{"text": final_prompt}]}]}
     headers = {"Content-Type": "application/json"}
@@ -197,6 +206,38 @@ Answer:"""
 
 
 
+@app.get("/")
+async def root():
+    return {"message": "FastAPI on Azure App Service!"}
+
+@app.post("/rename_session")
+async def rename_session(
+    session_id: str = Body(...),
+    new_name: str = Body(...)
+):
+    result = await sessions_collection.update_one(
+        {"_id": ObjectId(session_id)},
+        {"$set": {"session_name": new_name}}
+    )
+
+    if result.modified_count == 1:
+        return {"message": "✅ Session renamed successfully"}
+    else:
+        raise HTTPException(status_code=404, detail="❌ Session not found or already renamed")
+
+@app.delete("/delete_session/{id}")
+async def delete_session(id: str):
+    session_result = await sessions_collection.delete_one({"_id": ObjectId(id)})
+    files_result = await files_collection.delete_many({"session_id": id})
+
+    if session_result.deleted_count == 1:
+        return {
+            "message": "✅ Session deleted successfully",
+            "deleted_files": files_result.deleted_count
+        }
+    else:
+        raise HTTPException(status_code=404, detail="❌ Session not found")
+
 @app.post("/transcribe")
 async def transcribe(file: UploadFile = File(...)):
     with open("temp_audio.wav", "wb") as buffer:
@@ -205,6 +246,54 @@ async def transcribe(file: UploadFile = File(...)):
     result = model.transcribe("temp_audio.wav")
     os.remove("temp_audio.wav")
     return {"text": result.get("text", ""), "raw": result}
+
+
+
+def generate_share_id(length=8):
+    return ''.join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(length))
+
+def generate_pin():
+    return str(random.randint(1000, 9999))
+
+@app.post("/share_session/{session_id}")
+async def share_session(session_id: str):
+    session = await sessions_collection.find_one({"_id": ObjectId(session_id)})
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    share_id = generate_share_id()
+    pin = generate_pin()
+
+    await shared_collection.insert_one({
+        "share_id": share_id,
+        "pin": pin,
+        "session_id": ObjectId(session_id),
+        "created_at": datetime.utcnow()
+    })
+
+    return {"share_id": share_id, "pin": pin}
+
+
+
+@app.get("/view_shared_session/{share_id}")
+async def view_shared_session(share_id: str, pin: str = Query(...)):
+    shared = await shared_collection.find_one({"share_id": share_id, "pin": pin})
+    if not shared:
+        raise HTTPException(status_code=403, detail="Invalid share ID or PIN")
+
+    session = await sessions_collection.find_one({"_id": shared["session_id"]})
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    formatted_messages = []
+    for msg in session.get("messages", []):
+        formatted_messages.append({"role": "user", "text": msg["prompt"]})
+        formatted_messages.append({"role": "bot", "text": msg["response"]})
+
+    return {
+        "session_name": session.get("session_name", "Untitled"),
+        "messages": formatted_messages
+    }
 
 
 # @app.post("/upload_files")
@@ -341,7 +430,7 @@ def generate_session_name(prompt: str, response: str) -> str:
         for keyword in ["IPC", "Section", "Act", "law", "case", "rule", "rights", "punishment"]:
             if keyword.lower() in phrase.lower():
                 return f"{keyword.upper()} Discussion"
-    return "Legal Chat Session"
+    return "Chat Session"
 
 
 @app.post("/add_message")
@@ -352,7 +441,7 @@ async def add_message(
     response: str = Form(...)
 ):
     message = {
-        "prompt": prompt,
+        "prompt": prompt, 
         "response": response,
         "timestamp": datetime.now(IST)
     }
