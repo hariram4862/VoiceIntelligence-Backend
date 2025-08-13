@@ -1,10 +1,12 @@
+
+
 from fastapi import FastAPI, HTTPException, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from datetime import datetime
 from fastapi import Body
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import pytz
 import whisper
 import shutil
@@ -20,6 +22,13 @@ import fitz  # PyMuPDF
 from sentence_transformers import SentenceTransformer
 import numpy as np
 app = FastAPI()
+from azure.storage.blob import BlobServiceClient
+
+AZURE_CONNECTION_STRING = "DefaultEndpointsProtocol=https;AccountName=chatfilemetadata;AccountKey=K7bLuQ2EvyZ9uOdTwrv3SSx4/5LXOOPNxGPZI26IZdq3eagfqR7mW7ULmp6eM+Cz5ch8dH9gTMAZ+AStxf9+/A==;EndpointSuffix=core.windows.net"  # From your Azure portal
+AZURE_CONTAINER_NAME = "uploadedfiles"  # Must exist in your Storage Account
+
+blob_service = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
+container_client = blob_service.get_container_client(AZURE_CONTAINER_NAME)
 
 # CORS for frontend
 app.add_middleware(
@@ -53,20 +62,20 @@ GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.
 # Qdrant & Embedding setup
 embed_model = SentenceTransformer('all-MiniLM-L6-v2')
 
-
-def extract_text_from_file(path, ext):
+# ---------- Utils ----------
+def extract_text_from_file(path: str, ext: str) -> Optional[str]:
     try:
-        if ext == '.pdf':
+        if ext == ".pdf":
             doc = fitz.open(path)
-            text = "".join([page.get_text() for page in doc])
+            text = "".join([p.get_text() for p in doc])
             doc.close()
-        elif ext == '.docx':
+        elif ext == ".docx":
             document = Document(path)
             text = "\n".join(p.text for p in document.paragraphs)
-        elif ext in ['.png', '.jpg', '.jpeg']:
+        elif ext in [".png", ".jpg", ".jpeg"]:
             text = pytesseract.image_to_string(Image.open(path))
-        elif ext == '.txt':
-            with open(path, 'r', encoding='utf-8') as f:
+        elif ext == ".txt":
+            with open(path, "r", encoding="utf-8") as f:
                 text = f.read()
         else:
             return None
@@ -74,135 +83,228 @@ def extract_text_from_file(path, ext):
     except:
         return None
 
-def split_text(text, max_length=500, overlap=50):
-    words = text.split()
-    chunks, current_chunk = [], []
-    current_length = 0
-    for word in words:
-        if current_length + len(word) + 1 > max_length and current_chunk:
-            chunks.append(" ".join(current_chunk))
-            current_chunk = current_chunk[-(len(current_chunk)//2):]
-            current_length = sum(len(w) for w in current_chunk)
-        current_chunk.append(word)
-        current_length += len(word) + 1
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
+def split_text(text: str, max_length: int = 500) -> List[str]:
+    words, chunks, cur = text.split(), [], []
+    cur_len = 0
+    for w in words:
+        if cur_len + len(w) + 1 > max_length and cur:
+            chunks.append(" ".join(cur))
+            keep = max(1, int(len(cur) * 0.4))  # ~40% overlap
+            cur = cur[-keep:]
+            cur_len = sum(len(x) for x in cur) + len(cur) - 1
+        cur.append(w)
+        cur_len += len(w) + 1
+    if cur:
+        chunks.append(" ".join(cur))
     return chunks
 
-async def embed_and_store(file: UploadFile, email: str, session_id: str):
-    ext = os.path.splitext(file.filename)[1].lower()
-    temp_path = f"temp_{file.filename}"
-    with open(temp_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+async def upload_to_blob(filename: str, content: bytes) -> str:
+    blob_client = container_client.get_blob_client(filename)
+    blob_client.upload_blob(content, overwrite=True)
+    return blob_client.url
 
-    text = extract_text_from_file(temp_path, ext)
-    os.remove(temp_path)
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10))
+
+async def embed_and_store_bytes(filename: str, content: bytes, email: str, session_id: str, blob_url: str) -> int:
+    ext = os.path.splitext(filename)[1].lower()
+    tmp = f"tmp_{filename}"
+    with open(tmp, "wb") as f:
+        f.write(content)
+
+    text = extract_text_from_file(tmp, ext)
+    os.remove(tmp)
     if not text:
         raise ValueError("No text extracted from file.")
 
     chunks = split_text(text)
     vectors = embed_model.encode(chunks, show_progress_bar=False)
-
-    chunk_data = []
-    for i in range(len(chunks)):
-        chunk_data.append({
-            "index": i,
-            "text": chunks[i],
-            "vector": vectors[i].tolist()
-        })
+    chunk_data = [{"index": i, "text": chunks[i], "vector": vectors[i].tolist()} for i in range(len(chunks))]
 
     doc = {
         "email": email,
         "session_id": session_id,
-        "filename": file.filename,
-        "chunks": chunk_data
+        "filename": filename,
+        "blob_url": blob_url,  # ✅ Store Azure Blob URL for download
+        "chunks": chunk_data,
+        "created_at": datetime.now(IST),
     }
-
     await files_collection.insert_one(doc)
     return len(chunks)
 
-def cosine_similarity(a, b):
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10)
 
-@app.post("/query_or_upload")
-async def query_or_upload(
-    files: Optional[List[UploadFile]] = File(None),
-    prompt: Optional[str] = Form(None),
-    email: Optional[str] = Form(None),
-    session_id: Optional[str] = Form(None)
-):
-    results = []
+async def ensure_session(email: str, prompt: str, response: str, session_id: Optional[str]) -> Dict[str, Any]:
+    if not session_id:
+        session_name = await generate_session_name_async(prompt, response)
+        session_data = {
+            "user_email": email,
+            "session_name": session_name,
+            "created_at": datetime.now(IST),
+            "messages": [{"prompt": prompt, "response": response, "timestamp": datetime.now(IST)}],
+        }
+        result = await sessions_collection.insert_one(session_data)
+        return {"session_id": str(result.inserted_id), "session_name": session_name}
+    else:
+        await sessions_collection.update_one(
+            {"_id": ObjectId(session_id)},
+            {"$push": {"messages": {"prompt": prompt, "response": response, "timestamp": datetime.now(IST)}}}
+        )
+        ses = await sessions_collection.find_one({"_id": ObjectId(session_id)}, {"session_name": 1})
+        return {"session_id": session_id, "session_name": ses.get("session_name", "Untitled") if ses else "Untitled"}
 
-    if files:
-        for file in files:
-            try:
-                chunk_count = await embed_and_store(file, email, session_id)
-                results.append({"filename": file.filename, "chunks": chunk_count})
-            except Exception as e:
-                results.append({"filename": file.filename, "error": str(e)})
+async def top_k_chunks(email: str, session_id: str, query: str, k: int = 5) -> List[str]:
+    query_vec = embed_model.encode([query])[0]
+    docs = await files_collection.find({"email": email, "session_id": session_id}).to_list(length=1000)
+    scored = []
+    for d in docs:
+        for ch in d.get("chunks", []):
+            sim = cosine_similarity(np.array(ch["vector"]), np.array(query_vec))
+            scored.append((sim, ch["text"]))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [t for _, t in scored[:k]]
 
-    if not prompt:
-        return {"message": "✅ Documents processed.", "upload_results": results}
-
-    query_vec = embed_model.encode([prompt])[0].tolist()
-
-    documents = await files_collection.find({
-        "email": email,
-        "session_id": session_id
-    }).to_list(length=100)
-
-    similarities = []
-    for doc in documents:
-        for chunk in doc.get("chunks", []):
-            sim = cosine_similarity(np.array(chunk["vector"]), np.array(query_vec))
-            similarities.append({
-                "text": chunk["text"],
-                "score": sim
-            })
-
-    top_chunks = sorted(similarities, key=lambda x: x["score"], reverse=True)[:5]
-    relevant_chunks = [c["text"] for c in top_chunks]
-
-    if relevant_chunks:
-        context = "\n\n".join(relevant_chunks[:3])
-        final_prompt = f"""You are a chatbot. Use the context below to answer the user's prompt.
+def build_prompt_with_context(context: List[str], user_q: Optional[str]) -> str:
+    ctx = "\n\n".join(context[:3]) if context else ""
+    if user_q:
+        if ctx:
+            return f"""You are a helpful assistant. Use ONLY the following context to answer.
 
 Context:
-{context}
+{ctx}
 
 Question:
-{prompt}
+{user_q}
 
-Answer:"""
+Answer (be concise, bullet where helpful):"""
+        else:
+            return f"""You are a helpful assistant. Answer the following:
+
+Question:
+{user_q}
+
+Answer (be concise):"""
     else:
-    # Fallback to just using the prompt if no document context is available
-        final_prompt = f"""You are a chatbot. Answer the user's question below based on your knowledge.
+        return f"""You are a helpful assistant. Summarize the following context into key points and action items.
 
-Question:
-{prompt}
+Context:
+{ctx}
 
 Answer:"""
 
+def call_gemini(prompt_text: str) -> str:
+    try:
+        payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
+        headers = {"Content-Type": "application/json"}
+        r = requests.post(GEMINI_URL, headers=headers, json=payload, timeout=60)
+        j = r.json()
+        if "candidates" in j:
+            return j["candidates"][0]["content"]["parts"][0].get("text", "").strip()
+        return "Gemini failed to generate a valid response."
+    except Exception as e:
+        return f"Gemini error: {e}"
 
-    payload = {"contents": [{"parts": [{"text": final_prompt}]}]}
-    headers = {"Content-Type": "application/json"}
-    response = requests.post(GEMINI_URL, headers=headers, json=payload)
-    result = response.json()
+async def generate_session_name_async(prompt: str, response: str) -> str:
+    try:
+        instruction = "Suggest (only one; 3-4 words; no extra text) a chat session name for the following prompt:\n"
+        name = call_gemini(instruction + prompt)
+        name = name.strip().title() if name else "Chat Session"
+        return name[:50] or "Chat Session"
+    except:
+        return "Chat Session"
 
-    if "candidates" in result:
-        answer = result["candidates"][0]["content"]["parts"][0].get("text", "")
-        return {
-            "message": "✅ Documents processed and response generated.",
-            "upload_results": results,
-            "response": answer.strip()
-        }
+# ---------- New split routes ----------
+
+@app.post("/v1/prompt-only")
+async def route_prompt_only(
+    prompt: str = Form(...),
+    email: str = Form(...),
+    session_id: Optional[str] = Form(None)
+):
+    context: List[str] = []
+    if session_id:
+        # Use previously uploaded chunks in this session
+        context = await top_k_chunks(email, session_id, query=prompt, k=7)
+
+    final_prompt = build_prompt_with_context(context, user_q=prompt)
+    answer = call_gemini(final_prompt)
+    ses = await ensure_session(email=email, prompt=prompt, response=answer, session_id=session_id)
+    return {"response": answer, **ses}
+
+@app.post("/v1/files-only")
+async def route_files_only(
+    files: List[UploadFile] = File(...),
+    email: str = Form(...),
+    session_id: Optional[str] = Form(None),
+):
+    if not session_id:
+        tmp = await ensure_session(email, "Uploaded files", "Processing…", None)
+        session_id = tmp["session_id"]
+
+    results = []
+    for f in files:
+        try:
+            content = await f.read()
+            await f.seek(0)
+            blob_url = await upload_to_blob(f.filename, content)
+            chunk_count = await embed_and_store_bytes(f.filename, content, email, session_id, blob_url)
+            results.append({"filename": f.filename, "chunks": chunk_count, "blob_url": blob_url})
+        except Exception as e:
+            results.append({"filename": f.filename, "error": str(e)})
+
+
+
+    context = []
+    if results and not all(("error" in r) for r in results):
+        context = await top_k_chunks(email, session_id, query="summarize the uploaded documents", k=7)
+
+    final_prompt = build_prompt_with_context(context, user_q=None)
+    answer = call_gemini(final_prompt) if context else "Files uploaded and processed."
+
+    fake_prompt = "Uploaded files: " + ", ".join([r["filename"] for r in results if "filename" in r])
+    await ensure_session(email=email, prompt=fake_prompt, response=answer, session_id=session_id)
 
     return {
-        "message": "⚠️ Gemini failed to respond.",
+        "message": "✅ Documents processed.",
         "upload_results": results,
-        "response": "Gemini failed to generate a valid response."
+        "response": answer,
+        "session_id": session_id
     }
 
+@app.post("/v1/files-plus-prompt")
+async def route_files_plus_prompt(
+    files: List[UploadFile] = File(...),
+    prompt: str = Form(...),
+    email: str = Form(...),
+    session_id: Optional[str] = Form(None),
+):
+    if not session_id:
+        tmp = await ensure_session(email, prompt, "Processing…", None)
+        session_id = tmp["session_id"]
+
+    results = []
+    for f in files:
+        try:
+            content = await f.read()
+            await f.seek(0)
+            blob_url = await upload_to_blob(f.filename, content)
+            chunk_count = await embed_and_store_bytes(f.filename, content, email, session_id, blob_url)
+            results.append({"filename": f.filename, "chunks": chunk_count, "blob_url": blob_url})
+        except Exception as e:
+            results.append({"filename": f.filename, "error": str(e)})
+
+
+
+    context = await top_k_chunks(email, session_id, query=prompt, k=7)
+    final_prompt = build_prompt_with_context(context, user_q=prompt)
+    answer = call_gemini(final_prompt)
+
+    ses = await ensure_session(email=email, prompt=prompt, response=answer, session_id=session_id)
+    return {
+        "message": "✅ Documents processed and response generated.",
+        "upload_results": results,
+        "response": answer,
+        **ses
+    }
 
 
 
