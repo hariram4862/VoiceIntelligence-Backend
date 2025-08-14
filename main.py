@@ -11,8 +11,10 @@ import pytz
 import whisper
 import shutil
 from fastapi import Query
-
+from dotenv import load_dotenv
 import os
+
+load_dotenv()  
 import requests
 import google.generativeai as genai
 from docx import Document
@@ -24,8 +26,10 @@ import numpy as np
 app = FastAPI()
 from azure.storage.blob import BlobServiceClient
 
-AZURE_CONNECTION_STRING = "DefaultEndpointsProtocol=https;AccountName=chatfilemetadata;AccountKey=K7bLuQ2EvyZ9uOdTwrv3SSx4/5LXOOPNxGPZI26IZdq3eagfqR7mW7ULmp6eM+Cz5ch8dH9gTMAZ+AStxf9+/A==;EndpointSuffix=core.windows.net"  # From your Azure portal
-AZURE_CONTAINER_NAME = "uploadedfiles"  # Must exist in your Storage Account
+AZURE_CONNECTION_STRING =os.getenv("AZURE_CONNECTION_STRING")
+AZURE_CONTAINER_NAME = os.getenv("AZURE_CONTAINER_NAME")
+
+
 
 blob_service = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
 container_client = blob_service.get_container_client(AZURE_CONTAINER_NAME)
@@ -42,7 +46,7 @@ app.add_middleware(
 model = whisper.load_model("base")  # Whisper for transcription
 
 # MongoDB Setup
-MONGO_URI = "mongodb+srv://hari123:hari123@cluster0.oxgsmkv.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+MONGO_URI = os.getenv("MONGO_URI")
 client = AsyncIOMotorClient(MONGO_URI)
 
 db = client.voice_intelligence
