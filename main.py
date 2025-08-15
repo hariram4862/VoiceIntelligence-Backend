@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import Body
 from typing import Any, Dict, List, Optional
 import pytz
@@ -47,7 +47,10 @@ model = whisper.load_model("base")  # Whisper for transcription
 
 # MongoDB Setup
 MONGO_URI = os.getenv("MONGO_URI")
-client = AsyncIOMotorClient(MONGO_URI)
+# MongoDB Setup
+from datetime import timezone
+client = AsyncIOMotorClient(MONGO_URI, tz_aware=True, tzinfo=timezone.utc)
+
 
 db = client.voice_intelligence
 users_collection = db.users
@@ -65,6 +68,17 @@ GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.
 
 # Qdrant & Embedding setup
 embed_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+
+def iso_utc(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:           # Mongo may give naive but UTC
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
+
 
 # ---------- Utils ----------
 def extract_text_from_file(path: str, ext: str) -> Optional[str]:
@@ -131,7 +145,7 @@ async def embed_and_store_bytes(filename: str, content: bytes, email: str, sessi
         "filename": filename,
         "blob_url": blob_url,  # ✅ Store Azure Blob URL for download
         "chunks": chunk_data,
-        "created_at": datetime.now(IST),
+        "created_at": datetime.now(timezone.utc),
     }
     await files_collection.insert_one(doc)
     return len(chunks)
@@ -143,7 +157,7 @@ async def ensure_session(email: str, prompt: str, response: str, session_id: Opt
         session_data = {
             "user_email": email,
             "session_name": session_name,
-            "created_at": datetime.now(IST),
+            "created_at": datetime.now(timezone.utc),
             "messages": [{"prompt": prompt, "response": response, "timestamp": datetime.now(IST)}],
         }
         result = await sessions_collection.insert_one(session_data)
@@ -374,7 +388,7 @@ async def share_session(session_id: str):
         "share_id": share_id,
         "pin": pin,
         "session_id": ObjectId(session_id),
-        "created_at": datetime.utcnow()
+        "created_at": datetime.now(timezone.utc),
     })
 
     return {"share_id": share_id, "pin": pin}
@@ -546,10 +560,11 @@ async def add_message(
     prompt: str = Form(...),
     response: str = Form(...)
 ):
+    now_utc = datetime.now(timezone.utc)
     message = {
         "prompt": prompt, 
         "response": response,
-        "timestamp": datetime.now(IST)
+        "created_at": now_utc
     }
 
     # If session_id is not provided, create a new session
@@ -558,14 +573,15 @@ async def add_message(
         session_data = {
             "user_email": email,
             "session_name": session_name,
-            "created_at": datetime.now(IST),
+            "created_at": now_utc,
             "messages": [message]
         }
         result = await sessions_collection.insert_one(session_data)
         return {
             "message": "✅ New session created with message",
             "session_id": str(result.inserted_id),
-            "session_name": session_name
+            "session_name": session_name,
+            "created_at":iso_utc(now_utc),
         }
 
     # If session_id provided, append message
@@ -575,7 +591,7 @@ async def add_message(
     )
 
     if result.modified_count == 1:
-        return {"message": "✅ Message added to session"}
+        return {"message": "✅ Message added to session", "created_at": iso_utc(now_utc) }
     else:
         raise HTTPException(status_code=404, detail="❌ Session not found")
 
