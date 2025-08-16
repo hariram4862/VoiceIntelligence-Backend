@@ -4,7 +4,7 @@ app = FastAPI()
 
 @app.get("/")
 def read_root():
-    return {"message": "Hello, Azure Free Tier!"}
+    return {"message": "Hello, Are Free Tier!"}
 
 @app.get("/ping")
 def ping():
