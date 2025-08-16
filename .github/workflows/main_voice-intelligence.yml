@@ -58,4 +58,4 @@ jobs:
         with:
           app-name: 'voice-intelligence'
           slot-name: 'Production'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_F544BD6B41B049E0B0A0957FFEBA51A6 }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_B543035001AA41B686374A4F91C4880A }}
