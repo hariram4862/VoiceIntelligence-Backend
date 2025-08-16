@@ -495,6 +495,7 @@ async def update_last_login(
 async def update_user_details(
     email: str = Form(...),
     full_name: str = Form(...)
+    
 ):
     result = await users_collection.update_one(
         {"_id": email},
