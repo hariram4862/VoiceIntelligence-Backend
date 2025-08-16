@@ -1,6 +1,36 @@
-# # main.py
-# from fastapi import FastAPI
+# main.py
+from fastapi import FastAPI
 
+app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"message": "Hello,  World!"}
+
+
+# from fastapi import FastAPI, HTTPException, Form, UploadFile, File
+# from fastapi.middleware.cors import CORSMiddleware
+# from motor.motor_asyncio import AsyncIOMotorClient
+# from bson import ObjectId
+# from datetime import datetime, timezone
+# from fastapi import Body
+# from typing import Any, Dict, List, Optional
+# import pytz
+# import whisper
+# import shutil
+# from fastapi import Query
+# from dotenv import load_dotenv
+# import os
+
+# load_dotenv()  
+# import requests
+# import google.generativeai as genai
+# from docx import Document
+# from PIL import Image
+# import pytesseract
+# import fitz  # PyMuPDF
+# from sentence_transformers import SentenceTransformer
+# import numpy as np
 # app = FastAPI()
 
 # @app.get("/")
@@ -613,10 +643,10 @@ async def get_sessions(email: str):
     return {"sessions": sessions}
 
 
-@app.get("/get_session_chat/{session_id}")
-async def get_session_chat(session_id: str):
-    session = await sessions_collection.find_one({"_id": ObjectId(session_id)})
-    if not session:
-        raise HTTPException(status_code=404, detail="❌ Session not found")
-    session["_id"] = str(session["_id"])
-    return session
+# @app.get("/get_session_chat/{session_id}")
+# async def get_session_chat(session_id: str):
+#     session = await sessions_collection.find_one({"_id": ObjectId(session_id)})
+#     if not session:
+#         raise HTTPException(status_code=404, detail="❌ Session not found")
+#     session["_id"] = str(session["_id"])
+#     return session
