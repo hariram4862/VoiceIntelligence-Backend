@@ -336,7 +336,7 @@ async def route_files_plus_prompt(
 
 @app.get("/")
 async def root():
-    return {"msg": "FastAPI on Azure App Service!"}
+    return {"message": "FastAPI on Azure App Service!"}
 
 @app.post("/rename_session")
 async def rename_session(
