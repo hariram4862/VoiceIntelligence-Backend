@@ -71,7 +71,7 @@ import random
 IST = pytz.timezone("Asia/Kolkata")
 
 # --- Gemini setup ---
-GEMINI_API_KEY = "AIzaSyC9sD6m7ReB0oaAYPH6Xawwi4WU5Ta6oQo"  # Replace this
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # Replace this
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
 # Qdrant & Embedding setup
@@ -220,14 +220,23 @@ Answer:"""
 def call_gemini(prompt_text: str) -> str:
     try:
         payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "X-goog-api-key": GEMINI_API_KEY,   # << correct place for API key
+        }
         r = requests.post(GEMINI_URL, headers=headers, json=payload, timeout=60)
         j = r.json()
-        if "candidates" in j:
+
+        if "error" in j:
+            return f"Gemini API error: {j['error'].get('message', 'Unknown error')}"
+
+        if "candidates" in j and j["candidates"]:
             return j["candidates"][0]["content"]["parts"][0].get("text", "").strip()
-        return "Gemini failed to generate a valid response."
+
+        return "Gemini returned empty response."
     except Exception as e:
         return f"Gemini error: {e}"
+
 
 async def generate_session_name_async(prompt: str, response: str) -> str:
     try:
