@@ -71,7 +71,7 @@ import random
 IST = pytz.timezone("Asia/Kolkata")
 
 # --- Gemini setup ---
-GEMINI_API_KEY = "AIzaSyA_ro-5MnFra6vuSJufp7LHiD4Tl0FslpQ"  # Replace this
+GEMINI_API_KEY = "AIzaSyC9sD6m7ReB0oaAYPH6Xawwi4WU5Ta6oQo"  # Replace this
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
 # Qdrant & Embedding setup
