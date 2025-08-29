@@ -21,6 +21,10 @@ import shutil
 from fastapi import Query
 from dotenv import load_dotenv
 import os
+import json
+from pydantic import BaseModel
+
+
 
 load_dotenv()  
 import requests
@@ -65,6 +69,7 @@ users_collection = db.users
 sessions_collection = db.sessions
 files_collection = db.files
 shared_collection = db.shared_sessions
+quiz_results_collection = db.quiz_results
 import secrets
 import random
 
@@ -629,3 +634,221 @@ async def get_session_chat(session_id: str):
         raise HTTPException(status_code=404, detail="❌ Session not found")
     session["_id"] = str(session["_id"])
     return session
+
+# ---------- Helpers used by quiz endpoints ----------
+def safe_json_parse(text: str):
+    try:
+        return json.loads(text)
+    except:
+        # Try to locate JSON substring
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(text[start:end+1])
+            except:
+                return None
+    return None
+
+# ---------- Quiz Routes ----------
+class GenerateQuizRequest(BaseModel):
+    prompt: Optional[str] = None
+    email: str
+    mode: str  # mcq | flashcard | teachback
+    session_id: Optional[str] = None
+
+@app.post("/generate_quiz")
+async def generate_quiz(
+    prompt: Optional[str] = Form(None),
+    email: str = Form(...),
+    mode: str = Form(...),  # "mcq","flashcard","teachback"
+    session_id: Optional[str] = Form(None),
+    files: Optional[List[UploadFile]] = File(None)
+):
+    # If files present, process & embed them (re-using existing code)
+    if files:
+        if not session_id:
+            tmp = await ensure_session(email, "Uploaded files (for quiz)", "Processing…", None)
+            session_id = tmp["session_id"]
+
+        upload_results = []
+        for f in files:
+            try:
+                content = await f.read()
+                await f.seek(0)
+                blob_url = await upload_to_blob(f.filename, content)
+                chunk_count = await embed_and_store_bytes(f.filename, content, email, session_id, blob_url)
+                upload_results.append({"filename": f.filename, "chunks": chunk_count, "blob_url": blob_url})
+            except Exception as e:
+                upload_results.append({"filename": f.filename, "error": str(e)})
+    else:
+        upload_results = []
+
+    # Build context using top_k_chunks if we have a session_id
+    context = []
+    if session_id:
+        context = await top_k_chunks(email, session_id, query=prompt or "learn", k=7)
+
+    # Build instructions for LLM based on mode
+    if mode.lower() == "mcq":
+        instr = (
+            "You are an assistant that *only* outputs JSON. Create 5 multiple-choice questions (or fewer if content small) "
+            "based ONLY on the context and optional prompt. Return JSON array: "
+            '[{"id":"q1","question":"...","options":["A","B","C","D"],"answer_index":0,"explanation":"..."}]\n\n'
+        )
+    elif mode.lower() == "flashcard":
+        instr = (
+            "You are an assistant that *only* outputs JSON. Create up to 10 flashcards based ONLY on the context/prompt. "
+            'Return JSON array: [{"id":"f1","front":"...", "back":"..."}]\n\n'
+        )
+    elif mode.lower() == "teachback":
+        instr = (
+            "You are an assistant that *only* outputs JSON. Produce:\n"
+            "{'lesson': 'short explanation (2-3 paragraphs)', 'prompts':[{'id':'t1','prompt':'...','rubric':['keyword1','keyword2']}]} \n"
+            "Create up to 3 prompts for student to 'teach back'.\n\n"
+        )
+    else:
+        raise HTTPException(status_code=400, detail="Invalid mode")
+
+    final_prompt = instr
+    if context:
+        final_prompt += "Context:\n" + "\n\n".join(context[:7]) + "\n\n"
+    if prompt:
+        final_prompt += "Focus: " + prompt + "\n\n"
+
+    raw = call_gemini(final_prompt)
+
+    parsed = safe_json_parse(raw)
+    if not parsed:
+        # fallback: return raw text under 'raw' field and error
+        parsed = {"error": "LLM output not parseable as JSON", "raw": raw}
+
+    # Save as session message
+    await ensure_session(email=email, prompt=prompt or f"Generated {mode} quiz", response=str(parsed), session_id=session_id)
+
+    # Store quiz metadata to quiz_results (store but without score yet)
+    quiz_doc = {
+        "email": email,
+        "session_id": session_id,
+        "mode": mode.lower(),
+        "generated_at": datetime.now(timezone.utc),
+        "quiz_payload": parsed,
+        "upload_results": upload_results
+    }
+    res = await quiz_results_collection.insert_one(quiz_doc)
+
+    return {"quiz_id": str(res.inserted_id), "quiz": parsed, "mode": mode.lower(), "session_id": session_id}
+
+# Request model for checking MCQ answers
+class CheckAnswersRequest(BaseModel):
+    quiz_id: Optional[str] = None
+    email: str
+    user_answers: Dict[str, Any]  # e.g. {"q1": 2, "q2": 0}
+    correct_answers: Optional[Dict[str, Any]] = None  # optional, for safety
+
+@app.post("/check_quiz_answers")
+async def check_quiz_answers(payload: CheckAnswersRequest):
+    # Retrieve quiz data if quiz_id passed
+    quiz_doc = None
+    if payload.quiz_id:
+        quiz_doc = await quiz_results_collection.find_one({"_id": ObjectId(payload.quiz_id)})
+    # Prefer correct_answers param if provided, else derive from quiz_doc
+    correct_map = {}
+    if payload.correct_answers:
+        correct_map = payload.correct_answers
+    elif quiz_doc and quiz_doc.get("quiz_payload"):
+        q = quiz_doc["quiz_payload"]
+        # If mcq format is array/dict
+        if isinstance(q, list):
+            # assume list of objects with id and answer_index
+            for item in q:
+                if "id" in item and "answer_index" in item:
+                    correct_map[item["id"]] = item["answer_index"]
+        elif isinstance(q, dict) and q.get("questions"):
+            for item in q.get("questions", []):
+                if "id" in item and "answer_index" in item:
+                    correct_map[item["id"]] = item["answer_index"]
+    # Score
+    total = len(correct_map)
+    correct = 0
+    for qid, correct_idx in correct_map.items():
+        user_sel = payload.user_answers.get(qid)
+        # allow string numbers or ints
+        try:
+            if user_sel is None:
+                continue
+            if int(user_sel) == int(correct_idx):
+                correct += 1
+        except:
+            # try string comparison
+            if str(user_sel).strip().lower() == str(correct_idx).strip().lower():
+                correct += 1
+
+    percentage = round((correct / total) * 100, 2) if total > 0 else 0
+
+    # Store result
+    result_doc = {
+        "quiz_id": payload.quiz_id,
+        "email": payload.email,
+        "score": correct,
+        "total": total,
+        "percentage": percentage,
+        "user_answers": payload.user_answers,
+        "evaluated_at": datetime.now(timezone.utc)
+    }
+    await quiz_results_collection.insert_one(result_doc)
+
+    return {"score": correct, "total": total, "percentage": percentage}
+
+# Teachback grading route - uses Gemini to grade by rubric or compares keywords
+class TeachbackGradeRequest(BaseModel):
+    quiz_id: Optional[str] = None
+    email: str
+    user_text: str
+    rubric: Optional[List[str]] = None  # list of keywords or expected points
+
+@app.post("/grade_teachback")
+async def grade_teachback(payload: TeachbackGradeRequest):
+    # If rubric provided, do simple keyword scoring, else ask Gemini to grade
+    score = 0
+    feedback = ""
+    if payload.rubric:
+        found = 0
+        lowered = payload.user_text.lower()
+        for kw in payload.rubric:
+            if kw.lower() in lowered:
+                found += 1
+        total = len(payload.rubric)
+        percentage = round((found / total) * 100, 2) if total>0 else 0
+        score = int(round(percentage))
+        feedback = f"Found {found}/{total} rubric items."
+    else:
+        # ask Gemini to grade freely (we will send grading instruction)
+        grading_prompt = (
+            "You are an assistant that MUST respond in JSON. Grade the following student answer on a scale 0-100 and provide "
+            "short feedback. Return JSON: {\"score\": int, \"feedback\": \"...\"}\n\n"
+            f"Student answer:\n{payload.user_text}\n\n"
+            "Be concise."
+        )
+        raw = call_gemini(grading_prompt)
+        parsed = safe_json_parse(raw)
+        if parsed and isinstance(parsed, dict) and "score" in parsed:
+            score = int(parsed.get("score", 0))
+            feedback = str(parsed.get("feedback",""))
+        else:
+            # fallback naive: 0
+            score = 0
+            feedback = "Could not auto-grade (LLM parsing failed)."
+
+    # Store result
+    result_doc = {
+        "quiz_id": payload.quiz_id,
+        "email": payload.email,
+        "teachback_score": score,
+        "feedback": feedback,
+        "user_text": payload.user_text,
+        "evaluated_at": datetime.now(timezone.utc)
+    }
+    await quiz_results_collection.insert_one(result_doc)
+
+    return {"score": score, "feedback": feedback}
