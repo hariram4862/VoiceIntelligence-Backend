@@ -637,18 +637,21 @@ async def get_session_chat(session_id: str):
 
 # ---------- Helpers used by quiz endpoints ----------
 def safe_json_parse(text: str):
+    if not text:
+        return None
     try:
-        return json.loads(text)
-    except:
-        # Try to locate JSON substring
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            try:
-                return json.loads(text[start:end+1])
-            except:
-                return None
-    return None
+        # Remove markdown code fences like ```json ... ```
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            # remove optional "json" after ```
+            if cleaned.lower().startswith("json"):
+                cleaned = cleaned[4:].strip()
+        # Try parsing
+        return json.loads(cleaned)
+    except Exception as e:
+        print("Parse error:", e)
+        return None
 
 # ---------- Quiz Routes ----------
 class GenerateQuizRequest(BaseModel):
@@ -718,7 +721,7 @@ async def generate_quiz(
 
     raw = call_gemini(final_prompt)
 
-    parsed = safe_json_parse(raw)
+    parsed = safe_json_parse(raw) or {}
     if not parsed:
         # fallback: return raw text under 'raw' field and error
         parsed = {"error": "LLM output not parseable as JSON", "raw": raw}
